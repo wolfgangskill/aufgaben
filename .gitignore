@@ -1,0 +1,9 @@
+# Lokale Werkzeug-Einstellungen, gehören nicht ins öffentliche Repository
+.claude/
+.DS_Store
+
+# Sicherheitshalber: Geheimnisse nie einchecken
+.env
+.env.*
+*.key
+*-token
