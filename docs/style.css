@@ -49,7 +49,12 @@ button { cursor: pointer; }
 /* Kopfzeile */
 .topbar { display: flex; align-items: center; justify-content: space-between; padding: 14px 0 10px; gap: 8px; }
 .topbar h1 { font-size: 1.4rem; margin: 0; }
+.topbar { flex-wrap: wrap; }
 .topbar .actions { display: flex; gap: 6px; }
+@media (max-width: 440px) {
+  .topbar .btn { padding: 0 10px; }
+  .topbar .actions { gap: 4px; }
+}
 
 .btn {
   min-height: 44px; padding: 0 14px; border-radius: 12px;
@@ -145,6 +150,13 @@ button { cursor: pointer; }
 .note .excerpt { display: block; margin-top: 2px; color: var(--muted); overflow-wrap: anywhere; }
 .note .meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .badge.when { background: transparent; color: var(--muted); padding-left: 2px; }
+
+/* Tags */
+.tagchip { min-height: 34px; padding: 0 12px; font-size: .9rem; }
+.tag-input { flex: 1 1 140px; min-width: 120px; min-height: 34px; padding: 0 12px; border-radius: 999px; border: 1px dashed var(--border); background: transparent; }
+.badge.tag { background: transparent; color: var(--accent); border: 1px solid var(--border); cursor: pointer; }
+.badge.tag:hover, .badge.tag:focus-visible { border-color: var(--accent); }
+.uses { align-self: center; min-width: 2.2em; text-align: right; }
 
 /* Suche */
 .searchbar { margin: 0 0 14px; }

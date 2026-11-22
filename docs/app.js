@@ -10,6 +10,12 @@ const sb = window.supabase.createClient(window.APP_CONFIG.url, window.APP_CONFIG
 // Nur diese Spalten laden (die Suchspalte "search" wird nicht mit übertragen).
 const TASK_COLS = "id, area_id, title, status, due_date, priority, completed_at, created_at, updated_at";
 const NOTE_COLS = "id, area_id, body, created_at, updated_at";
+// Mit eingebetteten Tag-Verknüpfungen (ein Aufruf liefert Eintrag und seine Tags).
+const TASK_SEL = TASK_COLS + ", task_tags(tag_id)";
+const NOTE_SEL = NOTE_COLS + ", note_tags(tag_id)";
+// Aus der Antwort der Datenbank wird ein Eintrag mit einfacher Liste tag_ids.
+const normTask = ({ task_tags, ...r }) => ({ ...r, tag_ids: (task_tags ?? []).map((x) => x.tag_id) });
+const normNote = ({ note_tags, ...r }) => ({ ...r, tag_ids: (note_tags ?? []).map((x) => x.tag_id) });
 
 const PRIORITIES = [
   { value: 0, label: "Normal" },
@@ -111,6 +117,12 @@ let notesError = null;            // Meldung, falls die Tabelle "notes" nicht er
 let page = "tasks";               // tasks | notes
 let noteView = { areaId: null };  // null = alle Areas
 
+// Tags
+let tags = [];                    // [{ id, name }], nach Name sortiert
+let tagsError = null;
+const sortTags = () => tags.sort((a, b) => a.name.localeCompare(b.name, "de", { sensitivity: "base" }));
+const tagLabel = (id) => "#" + (tags.find((t) => t.id === id)?.name ?? "?");
+
 // Suche
 let searchQuery = "";
 let searchResults = [];
@@ -157,11 +169,12 @@ function applyTask(row) {
 
 // ---------- Daten laden und speichern ----------
 async function load() {
-  const [a, o, d, nt] = await Promise.all([
+  const [a, o, d, nt, tg] = await Promise.all([
     sb.from("areas").select("*").order("sort_order").order("name"),
-    sb.from("tasks").select(TASK_COLS).eq("status", "open"),
-    sb.from("tasks").select(TASK_COLS).eq("status", "done").order("completed_at", { ascending: false }).limit(100),
-    sb.from("notes").select(NOTE_COLS).order("updated_at", { ascending: false }).limit(500),
+    sb.from("tasks").select(TASK_SEL).eq("status", "open"),
+    sb.from("tasks").select(TASK_SEL).eq("status", "done").order("completed_at", { ascending: false }).limit(100),
+    sb.from("notes").select(NOTE_SEL).order("updated_at", { ascending: false }).limit(500),
+    sb.from("tags").select("id, name"),
   ]);
   const err = a.error || o.error || d.error;
   if (err) {
@@ -169,26 +182,91 @@ async function load() {
     return;
   }
   areas = a.data;
-  openTasks = o.data;
-  doneTasks = d.data;
-  // Notizen getrennt behandeln: Fehlt die Tabelle, sollen die Aufgaben trotzdem funktionieren.
+  openTasks = o.data.map(normTask);
+  doneTasks = d.data.map(normTask);
+  // Notizen und Tags getrennt behandeln: Fehlen die Tabellen, sollen die Aufgaben trotzdem funktionieren.
   notesError = nt.error ? nt.error.message : null;
-  notes = nt.error ? [] : nt.data;
+  notes = nt.error ? [] : nt.data.map(normNote);
+  tagsError = tg.error ? tg.error.message : null;
+  tags = tg.error ? [] : tg.data;
+  sortTags();
   if (view.type === "area" && !areas.some((x) => x.id === view.areaId)) view = { type: "open", areaId: null };
   render();
 }
 
-async function createTask(values) {
+// ---------- Tags: anlegen, auflösen, mit Einträgen verknüpfen ----------
+// Liefert den Tag mit diesem Namen (ohne Unterschied zwischen Groß und Klein); legt ihn an, falls er fehlt.
+async function ensureTag(name) {
+  const find = () => tags.find((t) => t.name.toLowerCase() === name.toLowerCase());
+  let t = find();
+  if (t) return t;
+  const { data, error } = await sb.from("tags").insert({ name }).select("id, name").single();
+  if (error) {
+    if (error.code === "23505") { // gibt es schon (z. B. auf einem anderen Gerät angelegt)
+      const r = await sb.from("tags").select("id, name");
+      if (!r.error) { tags = r.data; sortTags(); t = find(); if (t) return t; }
+    }
+    throw error;
+  }
+  tags.push(data);
+  sortTags();
+  return data;
+}
+
+// Auswahl aus dem Tag-Feld (bestehende ids plus neue Namen) in eine Liste von ids umwandeln.
+async function resolveTags(sel) {
+  const ids = new Set(sel.ids);
+  for (const name of sel.fresh) ids.add((await ensureTag(name)).id);
+  return [...ids];
+}
+
+// Gleicht die Verknüpfungen eines Eintrags mit der neuen Auswahl ab (nur Unterschiede werden geschrieben).
+async function syncTags(kind, itemId, newIds, oldIds) {
+  const table = kind === "task" ? "task_tags" : "note_tags";
+  const col = kind === "task" ? "task_id" : "note_id";
+  const add = newIds.filter((x) => !oldIds.includes(x));
+  const del = oldIds.filter((x) => !newIds.includes(x));
+  if (add.length) {
+    const { error } = await sb.from(table).insert(add.map((tag_id) => ({ [col]: itemId, tag_id })));
+    if (error) throw error;
+  }
+  if (del.length) {
+    const { error } = await sb.from(table).delete().eq(col, itemId).in("tag_id", del);
+    if (error) throw error;
+  }
+}
+
+async function createTask(values, tagSel) {
   const { data, error } = await sb.from("tasks").insert(values).select(TASK_COLS).single();
   if (error) throw error;
-  applyTask(data);
+  let ids = [];
+  try {
+    ids = await resolveTags(tagSel);
+    await syncTags("task", data.id, ids, []);
+  } catch (e) {
+    applyTask({ ...data, tag_ids: [] }); render();
+    throw new Error("Aufgabe gespeichert, aber Tags nicht: " + e.message);
+  }
+  applyTask({ ...data, tag_ids: ids });
   render();
 }
 
-async function updateTask(id, patch) {
+async function updateTask(id, patch, tagSel) {
+  const old = [...openTasks, ...doneTasks].find((t) => t.id === id);
   const { data, error } = await sb.from("tasks").update(patch).eq("id", id).select(TASK_COLS).single();
   if (error) throw error;
-  applyTask(data);
+  let ids = old?.tag_ids ?? [];
+  if (tagSel) {
+    try {
+      const wanted = await resolveTags(tagSel);
+      await syncTags("task", id, wanted, ids);
+      ids = wanted;
+    } catch (e) {
+      applyTask({ ...data, tag_ids: ids }); render();
+      throw new Error("Änderung gespeichert, aber Tags nicht: " + e.message);
+    }
+  }
+  applyTask({ ...data, tag_ids: ids });
   render();
 }
 
@@ -212,8 +290,58 @@ async function toggleDone(task) {
     toast("Nicht gespeichert: " + error.message, true);
     return;
   }
-  applyTask(data);
+  applyTask({ ...data, tag_ids: task.tag_ids ?? [] });
   render();
+}
+
+// ---------- Tag-Auswahl (für Aufgaben und Notizen) ----------
+// Bestehende Tags antippen = ein/aus. Neuer Tag: Namen tippen, Enter oder Komma. Neue Tags werden erst beim Speichern angelegt.
+function tagPicker(initIds, onChange) {
+  const sel = new Set(initIds ?? []);
+  const fresh = [];
+  const box = h("div", { class: "chips", role: "group", "aria-label": "Tags" });
+  const input = h("input", {
+    type: "text", class: "tag-input", placeholder: "Neuer Tag …", maxlength: 40, autocomplete: "off",
+    "aria-label": "Neuen Tag hinzufügen", enterkeyhint: "done",
+    onKeydown: (e) => {
+      if ((e.key === "Enter" || e.key === ",") && !e.isComposing) { e.preventDefault(); e.stopPropagation(); addFresh(); }
+    },
+  });
+
+  function addFresh() {
+    const name = input.value.replace(/,/g, "").trim().replace(/^#+/, "");
+    input.value = "";
+    if (!name) return;
+    const existing = tags.find((t) => t.name.toLowerCase() === name.toLowerCase());
+    if (existing) sel.add(existing.id);
+    else if (!fresh.some((f) => f.toLowerCase() === name.toLowerCase())) fresh.push(name);
+    paint();
+    onChange?.();
+  }
+
+  function paint() {
+    for (const id of [...sel]) if (!tags.some((t) => t.id === id)) sel.delete(id);
+    box.replaceChildren(
+      ...tags.map((t) => h("button", {
+        type: "button", class: "chip tagchip", "aria-pressed": String(sel.has(t.id)),
+        onClick: () => { if (sel.has(t.id)) sel.delete(t.id); else sel.add(t.id); paint(); onChange?.(); },
+      }, "#" + t.name)),
+      ...fresh.map((n, i) => h("button", {
+        type: "button", class: "chip tagchip", "aria-pressed": "true", title: "Neuer Tag, wird beim Speichern angelegt",
+        onClick: () => { fresh.splice(i, 1); paint(); onChange?.(); },
+      }, "#" + n + " (neu)")),
+      input);
+  }
+  paint();
+
+  return {
+    el: box, repaint: paint,
+    // Auswahl für das Speichern; ein noch nicht mit Enter bestätigter Text im Feld zählt mit.
+    selection: () => {
+      addFresh();
+      return { ids: [...sel], fresh: [...fresh] };
+    },
+  };
 }
 
 // ---------- Eingabefelder für Aufgaben (Formular und Bearbeiten-Dialog) ----------
@@ -269,19 +397,23 @@ function taskFields(init, { onChange, onSubmit }) {
       type: "button", class: "chip prio-" + p.value, "aria-pressed": String(s.priority === p.value),
       onClick: choose(() => { s.priority = p.value; }, prioBox, i),
     }, p.label)));
+    picker?.repaint();
   }
+  const picker = tagPicker(init.tag_ids, onChange);
   paint();
 
   const el = h("div", {},
     input,
     h("span", { class: "label" }, "Area (Pflicht)"), areaBox,
     h("span", { class: "label" }, "Fällig"), dueBox,
-    h("span", { class: "label" }, "Dringlichkeit"), prioBox);
+    h("span", { class: "label" }, "Dringlichkeit"), prioBox,
+    h("span", { class: "label" }, "Tags"), picker.el);
 
   return {
     el, input, repaint: paint,
     isValid: () => input.value.trim() !== "" && !!s.areaId,
     values: () => ({ title: input.value.trim(), area_id: s.areaId, due_date: s.due, priority: s.priority }),
+    tagSel: () => picker.selection(),
   };
 }
 
@@ -355,11 +487,27 @@ function renderTasks() {
   ui.list.replaceChildren(...tasks.map(taskRow));
 }
 
+// Tag-Etikett in Listen: Antippen sucht nach allem mit diesem Tag. Es ist ein span (kein button), weil es in einem button steht.
+function tagBadge(label) {
+  const go = (e) => { e.stopPropagation(); e.preventDefault(); searchByTag(label.replace(/^#/, "")); };
+  return h("span", {
+    class: "badge tag", role: "button", tabindex: "0", title: "Alles mit diesem Tag zeigen",
+    onClick: go, onKeydown: (e) => { if (e.key === "Enter" || e.key === " ") go(e); },
+  }, label);
+}
+
+function searchByTag(name) {
+  ui.search.input.value = "#" + name;
+  runSearch();
+  window.scrollTo({ top: 0 });
+}
+
 function taskRow(task) {
   const overdue = task.status === "open" && task.due_date && task.due_date < iso(startOfToday());
   const meta = [h("span", { class: "badge" }, areaName(task.area_id))];
   if (task.due_date) meta.push(h("span", { class: "badge" + (overdue ? " overdue" : "") }, (overdue ? "Überfällig · " : "") + dueLabel(task.due_date)));
   if (task.priority > 0) meta.push(h("span", { class: "badge prio-" + task.priority }, PRIORITIES[task.priority].label));
+  for (const id of task.tag_ids ?? []) meta.push(tagBadge(tagLabel(id)));
 
   return h("li", { class: `task prio-${task.priority}` + (task.status === "done" ? " done" : "") },
     h("button", {
@@ -383,7 +531,7 @@ function openEditDialog(task) {
     if (!fields.isValid()) return;
     saveBtn.disabled = true;
     try {
-      await updateTask(task.id, fields.values());
+      await updateTask(task.id, fields.values(), fields.tagSel());
       dlg.close();
     } catch (e) {
       toast("Nicht gespeichert: " + e.message, true);
@@ -403,6 +551,64 @@ function openEditDialog(task) {
         h("button", { type: "button", class: "btn", onClick: () => dlg.close() }, "Abbrechen"), saveBtn))));
   showDialog(dlg);
   updateSave();
+}
+
+// ---------- Dialog: Tags verwalten (umbenennen, löschen) ----------
+function openTagsDialog() {
+  const dlg = h("dialog");
+  const body = h("div", { class: "sheet" });
+  dlg.append(body);
+  // Anzahl der Einträge je Tag (nur geladene Einträge; sehr alte erledigte Aufgaben können fehlen)
+  const uses = (id) => [...openTasks, ...doneTasks, ...notes].filter((x) => (x.tag_ids ?? []).includes(id)).length;
+
+  async function rename(tag, input) {
+    const name = input.value.trim().replace(/^#+/, "");
+    if (!name || name === tag.name) { input.value = tag.name; return; }
+    const { error } = await sb.from("tags").update({ name }).eq("id", tag.id);
+    if (error) {
+      toast(error.code === "23505" ? "Diesen Tag gibt es schon." : "Nicht umbenannt: " + error.message, true);
+      input.value = tag.name;
+      return;
+    }
+    tag.name = name;
+    sortTags();
+    toast("Umbenannt");
+    render();
+    draw();
+  }
+
+  async function remove(tag) {
+    const { error } = await sb.from("tags").delete().eq("id", tag.id); // Verknüpfungen verschwinden mit
+    if (error) { toast("Nicht gelöscht: " + error.message, true); return; }
+    tags = tags.filter((t) => t.id !== tag.id);
+    for (const x of [...openTasks, ...doneTasks, ...notes]) x.tag_ids = (x.tag_ids ?? []).filter((id) => id !== tag.id);
+    render();
+    draw();
+  }
+
+  function draw() {
+    body.replaceChildren(...[
+      h("h2", {}, "Tags verwalten"),
+      tagsError ? h("p", { class: "hint" }, "Tags sind noch nicht eingerichtet: " + tagsError) : null,
+      !tags.length && !tagsError ? h("p", { class: "hint" }, "Noch keine Tags. Du legst sie beim Schreiben einer Aufgabe oder Notiz an.") : null,
+      ...tags.map((t) => {
+        const input = h("input", {
+          type: "text", class: "field", value: t.name, maxlength: 40, "aria-label": "Name des Tags",
+          onChange: () => rename(t, input),
+        });
+        return h("div", { class: "area-row" }, input,
+          h("div", { class: "tools" },
+            h("span", { class: "hint uses", title: "Verwendet in so vielen Einträgen" }, uses(t.id) + "×"),
+            confirmButton("Löschen", "Sicher?", () => remove(t), "small")));
+      }),
+      h("p", { class: "hint" }, "Löschen entfernt den Tag nur von den Einträgen, die Einträge selbst bleiben."),
+      h("div", { class: "row-actions" }, h("span"),
+        h("button", { type: "button", class: "btn", onClick: () => dlg.close() }, "Fertig")),
+    ].filter(Boolean));
+  }
+
+  draw();
+  showDialog(dlg, { focusDialog: true });
 }
 
 // ---------- Dialog: Areas verwalten ----------
@@ -511,17 +717,37 @@ function applyNote(row) {
   notes.sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
 }
 
-async function createNote(values) {
+async function createNote(values, tagSel) {
   const { data, error } = await sb.from("notes").insert(values).select(NOTE_COLS).single();
   if (error) throw error;
-  applyNote(data);
+  let ids = [];
+  try {
+    ids = await resolveTags(tagSel);
+    await syncTags("note", data.id, ids, []);
+  } catch (e) {
+    applyNote({ ...data, tag_ids: [] }); render();
+    throw new Error("Notiz gespeichert, aber Tags nicht: " + e.message);
+  }
+  applyNote({ ...data, tag_ids: ids });
   render();
 }
 
-async function updateNote(id, patch) {
+async function updateNote(id, patch, tagSel) {
+  const old = notes.find((n) => n.id === id);
   const { data, error } = await sb.from("notes").update(patch).eq("id", id).select(NOTE_COLS).single();
   if (error) throw error;
-  applyNote(data);
+  let ids = old?.tag_ids ?? [];
+  if (tagSel) {
+    try {
+      const wanted = await resolveTags(tagSel);
+      await syncTags("note", id, wanted, ids);
+      ids = wanted;
+    } catch (e) {
+      applyNote({ ...data, tag_ids: ids }); render();
+      throw new Error("Änderung gespeichert, aber Tags nicht: " + e.message);
+    }
+  }
+  applyNote({ ...data, tag_ids: ids });
   render();
 }
 
@@ -718,15 +944,20 @@ function noteFields(init, { onChange, onSubmit, rows = 4 }) {
         else if (window.matchMedia("(pointer: fine)").matches) ta.focus();
       },
     }, a.name)));
+    picker?.repaint();
   }
+  const picker = tagPicker(init.tag_ids, onChange);
   paint();
   requestAnimationFrame(() => autosize(ta));
 
   return {
-    el: h("div", {}, toolbar, ta, h("span", { class: "label" }, "Area (Pflicht)"), areaBox),
+    el: h("div", {}, toolbar, ta,
+      h("span", { class: "label" }, "Area (Pflicht)"), areaBox,
+      h("span", { class: "label" }, "Tags"), picker.el),
     toolbar, textarea: ta, repaint: paint,
     isValid: () => ta.value.trim() !== "" && !!s.areaId,
     values: () => ({ body: ta.value.trim(), area_id: s.areaId }),
+    tagSel: () => picker.selection(),
   };
 }
 
@@ -738,7 +969,8 @@ function noteRow(note) {
       excerpt ? h("span", { class: "excerpt" }, excerpt) : null,
       h("span", { class: "meta" },
         h("span", { class: "badge" }, areaName(note.area_id)),
-        h("span", { class: "badge when" }, shortWhen(note.updated_at)))));
+        h("span", { class: "badge when" }, shortWhen(note.updated_at)),
+        ...(note.tag_ids ?? []).map((id) => tagBadge(tagLabel(id))))));
 }
 
 function openNoteDialog(note) {
@@ -766,7 +998,7 @@ function openNoteDialog(note) {
     if (!fields.isValid()) return;
     saveBtn.disabled = true;
     try {
-      await updateNote(note.id, fields.values());
+      await updateNote(note.id, fields.values(), fields.tagSel());
       dlg.close();
     } catch (e) {
       toast("Nicht gespeichert: " + e.message, true);
@@ -802,7 +1034,7 @@ function buildNotesPage() {
     if (!fields.isValid()) return;
     saveBtn.disabled = true;
     try {
-      await createNote(fields.values());
+      await createNote(fields.values(), fields.tagSel());
       fields = noteFields({}, { onChange: updateSave, onSubmit: saveNew });
       holder.replaceChildren(fields.el);
       fields.textarea.focus();
@@ -929,6 +1161,7 @@ function resultRow(r) {
   ];
   if (isTask && r.status === "done") meta.push(h("span", { class: "badge" }, "Erledigt"));
   if (isTask && r.status === "open" && r.due_date) meta.push(h("span", { class: "badge" }, dueLabel(r.due_date)));
+  for (const name of r.tags ?? []) meta.push(tagBadge("#" + name));
   const snippet = snippetNodes(r.snippet, searchQuery);
   return h("li", { class: "note" },
     h("button", { type: "button", class: "body", onClick: () => openResult(r) },
@@ -940,11 +1173,17 @@ function resultRow(r) {
 async function openResult(r) {
   if (r.kind === "task") {
     let t = [...openTasks, ...doneTasks].find((x) => x.id === r.id);
-    if (!t) ({ data: t } = await sb.from("tasks").select(TASK_COLS).eq("id", r.id).single());
+    if (!t) {
+      const { data } = await sb.from("tasks").select(TASK_SEL).eq("id", r.id).single();
+      if (data) t = normTask(data);
+    }
     if (t) openEditDialog(t);
   } else {
     let n = notes.find((x) => x.id === r.id);
-    if (!n) ({ data: n } = await sb.from("notes").select(NOTE_COLS).eq("id", r.id).single());
+    if (!n) {
+      const { data } = await sb.from("notes").select(NOTE_SEL).eq("id", r.id).single();
+      if (data) n = normNote(data);
+    }
     if (n) openNoteDialog(n);
   }
 }
@@ -992,7 +1231,7 @@ function showApp() {
     if (!addFields.isValid()) return;
     saveBtn.disabled = true;
     try {
-      await createTask(addFields.values());
+      await createTask(addFields.values(), addFields.tagSel());
       addFields = taskFields({}, { onChange: updateSave, onSubmit: saveNew });
       form.replaceChildren(addFields.el, h("div", { class: "actions" }, saveBtn));
       addFields.input.focus();
@@ -1023,6 +1262,7 @@ function showApp() {
       ui.title,
       h("div", { class: "actions" },
         h("button", { type: "button", class: "btn", onClick: openAreasDialog }, "Areas"),
+        h("button", { type: "button", class: "btn", onClick: openTagsDialog }, "Tags"),
         h("button", { type: "button", class: "btn", onClick: () => sb.auth.signOut() }, "Abmelden"))),
     ui.tabs, ui.search.bar, ui.tasksPage, ui.notesPage, ui.search.page));
   renderTabs();
@@ -1034,7 +1274,7 @@ function showApp() {
 // ---------- Anmeldung ----------
 function showLogin() {
   appMounted = false;
-  areas = []; openTasks = []; doneTasks = []; notes = [];
+  areas = []; openTasks = []; doneTasks = []; notes = []; tags = [];
   clearSearch();
   const err = h("p", { class: "error", role: "alert" });
   const email = h("input", { type: "email", class: "field", required: true, autocomplete: "username", placeholder: "E-Mail", "aria-label": "E-Mail" });
