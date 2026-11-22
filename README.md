@@ -7,6 +7,7 @@ Persönliche Aufgabenliste und Notizen als Web-App (PWA). Jede Aufgabe und jede 
 - `supabase/02_notes.sql` – Tabelle für Notizen (nach 01 ausführen).
 - `supabase/03_search.sql` – Suche über Aufgaben und Notizen (deutscher Wortstamm plus Wortteil).
 - `supabase/04_tags.sql` – Tags für Aufgaben und Notizen, Suche kennt Tags.
+- `supabase/05_pin.sql` – Notizen anheften.
 - `supabase/functions/capture/` – kleine Funktion für die Schnellerfassung (Kurzbefehle).
 
 Die Daten liegen in einer privaten Supabase-Datenbank hinter einer Anmeldung.

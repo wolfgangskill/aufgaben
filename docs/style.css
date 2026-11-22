@@ -165,6 +165,22 @@ button { cursor: pointer; }
 .badge.kind { background: var(--accent); color: var(--accent-text); font-weight: 600; }
 mark { background: var(--accent-soft); color: inherit; border-radius: 3px; padding: 0 2px; font-weight: 600; }
 
+/* Anheften */
+.note { position: relative; }
+.note .body { padding-right: 56px; }
+.note .pin {
+  position: absolute; top: 4px; right: 4px; width: 44px; height: 44px; border-radius: 12px;
+  display: grid; place-items: center; background: none; border: 0; color: var(--muted); padding: 0;
+}
+.note .pin svg { width: 20px; height: 20px; }
+.note .pin:hover, .note .pin:focus-visible { color: var(--accent); }
+.note.pinned { border-left: 5px solid var(--accent); }
+.note.pinned .pin { color: var(--accent); }
+.dlg-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.dlg-head h2 { margin: 0; }
+.btn.small svg { width: 16px; height: 16px; vertical-align: -3px; }
+.btn.small[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+
 /* Formatierte Anzeige (Vorschau) */
 .preview { min-height: 96px; margin-bottom: 4px; }
 .md > :first-child { margin-top: 0; }

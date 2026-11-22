@@ -9,7 +9,7 @@ const sb = window.supabase.createClient(window.APP_CONFIG.url, window.APP_CONFIG
 
 // Nur diese Spalten laden (die Suchspalte "search" wird nicht mit übertragen).
 const TASK_COLS = "id, area_id, title, status, due_date, priority, completed_at, created_at, updated_at";
-const NOTE_COLS = "id, area_id, body, created_at, updated_at";
+const NOTE_COLS = "id, area_id, body, pinned_at, created_at, updated_at";
 // Mit eingebetteten Tag-Verknüpfungen (ein Aufruf liefert Eintrag und seine Tags).
 const TASK_SEL = TASK_COLS + ", task_tags(tag_id)";
 const NOTE_SEL = NOTE_COLS + ", note_tags(tag_id)";
@@ -186,7 +186,7 @@ async function load() {
   doneTasks = d.data.map(normTask);
   // Notizen und Tags getrennt behandeln: Fehlen die Tabellen, sollen die Aufgaben trotzdem funktionieren.
   notesError = nt.error ? nt.error.message : null;
-  notes = nt.error ? [] : nt.data.map(normNote);
+  notes = nt.error ? [] : nt.data.map(normNote).sort(compareNotes);
   tagsError = tg.error ? tg.error.message : null;
   tags = tg.error ? [] : tg.data;
   sortTags();
@@ -711,10 +711,52 @@ function showDialog(dlg, { focusDialog = false } = {}) {
 // ---------- Notizen ----------
 
 // Ersetzt eine Notiz im lokalen Zustand, zuletzt bearbeitete zuerst.
+// Reihenfolge: angeheftete zuerst (zuletzt angeheftete oben), danach nach letzter Bearbeitung.
+function compareNotes(a, b) {
+  if (!!a.pinned_at !== !!b.pinned_at) return a.pinned_at ? -1 : 1;
+  if (a.pinned_at) return a.pinned_at < b.pinned_at ? 1 : -1;
+  return a.updated_at < b.updated_at ? 1 : -1;
+}
+
 function applyNote(row) {
   notes = notes.filter((n) => n.id !== row.id);
   notes.push(row);
-  notes.sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+  notes.sort(compareNotes);
+}
+
+const PIN_PATH = "M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z";
+function pinIcon(filled) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const p = document.createElementNS(ns, "path");
+  p.setAttribute("d", PIN_PATH);
+  p.setAttribute("fill", filled ? "currentColor" : "none");
+  p.setAttribute("stroke", "currentColor");
+  p.setAttribute("stroke-width", "2");
+  p.setAttribute("stroke-linecap", "round");
+  p.setAttribute("stroke-linejoin", "round");
+  svg.append(p);
+  return svg;
+}
+
+// Anheften / Lösen. Zählt nicht als Bearbeiten (updated_at bleibt, dafür sorgt die Datenbank).
+async function togglePin(note) {
+  const cur = notes.find((n) => n.id === note.id) ?? note;
+  const before = { ...cur };
+  const next = cur.pinned_at ? null : new Date().toISOString();
+  applyNote({ ...cur, pinned_at: next });
+  render();
+  const { data, error } = await sb.from("notes").update({ pinned_at: next }).eq("id", cur.id).select(NOTE_COLS).single();
+  if (error) {
+    applyNote(before);
+    render();
+    toast("Nicht gespeichert: " + error.message, true);
+    return;
+  }
+  applyNote({ ...data, tag_ids: cur.tag_ids ?? [] });
+  render();
 }
 
 async function createNote(values, tagSel) {
@@ -963,14 +1005,20 @@ function noteFields(init, { onChange, onSubmit, rows = 4 }) {
 
 function noteRow(note) {
   const { title, excerpt } = noteTexts(note.body);
-  return h("li", { class: "note" },
+  const pinned = !!note.pinned_at;
+  return h("li", { class: "note" + (pinned ? " pinned" : "") },
     h("button", { type: "button", class: "body", onClick: () => openNoteDialog(note) },
       h("span", { class: "title" }, title || "(leer)"),
       excerpt ? h("span", { class: "excerpt" }, excerpt) : null,
       h("span", { class: "meta" },
         h("span", { class: "badge" }, areaName(note.area_id)),
         h("span", { class: "badge when" }, shortWhen(note.updated_at)),
-        ...(note.tag_ids ?? []).map((id) => tagBadge(tagLabel(id))))));
+        ...(note.tag_ids ?? []).map((id) => tagBadge(tagLabel(id))))),
+    h("button", {
+      type: "button", class: "pin", "aria-pressed": String(pinned),
+      "aria-label": pinned ? "Lösen" : "Anheften", title: pinned ? "Lösen" : "Anheften",
+      onClick: () => togglePin(note),
+    }, pinIcon(pinned)));
 }
 
 function openNoteDialog(note) {
@@ -980,6 +1028,14 @@ function openNoteDialog(note) {
   const saveBtn = h("button", { type: "submit", class: "btn primary" }, "Speichern");
   let mode = "write";
   const seg = h("div", { class: "seg", role: "tablist" });
+  // Anheften wirkt sofort, unabhängig von "Speichern".
+  const pinBtn = h("button", { type: "button", class: "btn small", onClick: async () => { await togglePin(note); paintPin(); } });
+  function paintPin() {
+    const on = !!notes.find((n) => n.id === note.id)?.pinned_at;
+    pinBtn.setAttribute("aria-pressed", String(on));
+    pinBtn.replaceChildren(pinIcon(on), on ? " Angeheftet" : " Anheften");
+  }
+  paintPin();
 
   function updateSave() { saveBtn.disabled = !fields.isValid(); }
   function paintMode() {
@@ -1013,7 +1069,7 @@ function openNoteDialog(note) {
   // Die Vorschau steht zwischen Werkzeugleiste/Textfeld und den Area-Buttons.
   fields.el.insertBefore(preview, fields.el.querySelector(".label"));
   dlg.append(h("form", { class: "sheet", onSubmit: (e) => { e.preventDefault(); save(); } },
-    h("h2", {}, "Notiz"), seg, fields.el,
+    h("div", { class: "dlg-head" }, h("h2", {}, "Notiz"), pinBtn), seg, fields.el,
     h("div", { class: "row-actions" }, del,
       h("div", { class: "right" },
         h("button", { type: "button", class: "btn", onClick: () => dlg.close() }, "Abbrechen"), saveBtn))));
