@@ -101,6 +101,13 @@ let appMounted = false;
 let ui = {};          // Verweise auf Bereiche der Oberfläche
 let addFields = null; // Eingabefelder des "Neue Aufgabe"-Formulars
 
+// Notizen
+let notes = [];
+let notesError = null;            // Meldung, falls die Tabelle "notes" nicht erreichbar ist
+let page = "tasks";               // tasks | notes
+let noteView = { areaId: null };  // null = alle Areas
+try { if (localStorage.getItem("page") === "notes") page = "notes"; } catch { /* ohne Speicher weiter */ }
+
 const areaName = (id) => areas.find((a) => a.id === id)?.name ?? "?";
 const openCount = (pred) => openTasks.filter(pred).length;
 
@@ -138,10 +145,11 @@ function applyTask(row) {
 
 // ---------- Daten laden und speichern ----------
 async function load() {
-  const [a, o, d] = await Promise.all([
+  const [a, o, d, nt] = await Promise.all([
     sb.from("areas").select("*").order("sort_order").order("name"),
     sb.from("tasks").select("*").eq("status", "open"),
     sb.from("tasks").select("*").eq("status", "done").order("completed_at", { ascending: false }).limit(100),
+    sb.from("notes").select("*").order("updated_at", { ascending: false }).limit(500),
   ]);
   const err = a.error || o.error || d.error;
   if (err) {
@@ -151,6 +159,9 @@ async function load() {
   areas = a.data;
   openTasks = o.data;
   doneTasks = d.data;
+  // Notizen getrennt behandeln: Fehlt die Tabelle, sollen die Aufgaben trotzdem funktionieren.
+  notesError = nt.error ? nt.error.message : null;
+  notes = nt.error ? [] : nt.data;
   if (view.type === "area" && !areas.some((x) => x.id === view.areaId)) view = { type: "open", areaId: null };
   render();
 }
@@ -286,6 +297,12 @@ function confirmButton(label, armedLabel, action, extraClass = "") {
 // ---------- Oberfläche ----------
 function render() {
   if (!appMounted) return;
+  renderTabs();
+  renderTasks();
+  renderNotes();
+}
+
+function renderTasks() {
   const today = iso(startOfToday());
 
   // Filterleiste
@@ -415,7 +432,7 @@ function openAreasDialog() {
   async function remove(area) {
     const { error } = await sb.from("areas").delete().eq("id", area.id);
     if (error) {
-      if (error.code === "23503") toast("Diese Area enthält noch Aufgaben (auch erledigte). Verschiebe oder lösche sie zuerst.", true);
+      if (error.code === "23503") toast("Diese Area enthält noch Aufgaben oder Notizen (auch erledigte Aufgaben). Verschiebe oder lösche sie zuerst.", true);
       else toast("Nicht gelöscht: " + error.message, true);
       return;
     }
@@ -472,6 +489,379 @@ function showDialog(dlg, { focusDialog = false } = {}) {
   if (focusDialog) dlg.focus();
 }
 
+// ---------- Notizen ----------
+
+// Ersetzt eine Notiz im lokalen Zustand, zuletzt bearbeitete zuerst.
+function applyNote(row) {
+  notes = notes.filter((n) => n.id !== row.id);
+  notes.push(row);
+  notes.sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+}
+
+async function createNote(values) {
+  const { data, error } = await sb.from("notes").insert(values).select().single();
+  if (error) throw error;
+  applyNote(data);
+  render();
+}
+
+async function updateNote(id, patch) {
+  const { data, error } = await sb.from("notes").update(patch).eq("id", id).select().single();
+  if (error) throw error;
+  applyNote(data);
+  render();
+}
+
+async function deleteNote(id) {
+  const { error } = await sb.from("notes").delete().eq("id", id);
+  if (error) throw error;
+  notes = notes.filter((n) => n.id !== id);
+  render();
+}
+
+// Liste: erste Zeile = Überschrift, Rest = Auszug. Markdown-Zeichen werden dafür entfernt.
+const plainLine = (l) => l.replace(/^\s*(#{1,3}\s+|[-*]\s+|\d+\.\s+)/, "").replace(/\*\*|\*/g, "").trim();
+function noteTexts(body) {
+  const lines = body.split("\n").map(plainLine).filter(Boolean);
+  return { title: (lines[0] ?? "").slice(0, 120), excerpt: lines.slice(1).join(" · ").slice(0, 160) };
+}
+
+function shortWhen(ts) {
+  const d = new Date(ts);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) {
+    return new Intl.DateTimeFormat("de-DE", { hour: "2-digit", minute: "2-digit" }).format(d);
+  }
+  const sameYear = d.getFullYear() === now.getFullYear();
+  return new Intl.DateTimeFormat("de-DE", { day: "numeric", month: "short", year: sameYear ? undefined : "numeric" }).format(d);
+}
+
+// --- Formatierung: eigener, sicherer Anzeiger für das kleine Markdown (kein HTML aus dem Text) ---
+function inlineNodes(text) {
+  const out = [];
+  const re = /\*\*([^*]+)\*\*|\*([^*\s][^*]*)\*|(https?:\/\/[^\s<]+)/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    if (m[1] !== undefined) {
+      out.push(h("strong", {}, m[1]));
+    } else if (m[2] !== undefined) {
+      out.push(h("em", {}, m[2]));
+    } else {
+      const trail = (m[3].match(/[.,;:!?)\]]+$/) || [""])[0];
+      const url = m[3].slice(0, m[3].length - trail.length);
+      out.push(h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, url));
+      if (trail) out.push(trail);
+    }
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+function renderMarkdown(text) {
+  const box = h("div", { class: "md" });
+  let list = null; // { kind, el }
+  let para = [];
+  const flushPara = () => {
+    if (!para.length) return;
+    const p = h("p", {});
+    para.forEach((line, i) => {
+      if (i) p.append(h("br"));
+      p.append(...inlineNodes(line));
+    });
+    box.append(p);
+    para = [];
+  };
+  const addItem = (kind, content) => {
+    flushPara();
+    if (!list || list.kind !== kind) {
+      list = { kind, el: h(kind) };
+      box.append(list.el);
+    }
+    list.el.append(h("li", {}, ...inlineNodes(content)));
+  };
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/\s+$/, "");
+    let m;
+    if (!line.trim()) { flushPara(); list = null; continue; }
+    if ((m = line.match(/^(#{1,3})\s+(.*)$/))) {
+      flushPara(); list = null;
+      box.append(h("h" + (m[1].length + 2), {}, ...inlineNodes(m[2])));
+    } else if ((m = line.match(/^\s*[-*]\s+(.*)$/))) {
+      addItem("ul", m[1]);
+    } else if ((m = line.match(/^\s*\d+\.\s+(.*)$/))) {
+      addItem("ol", m[1]);
+    } else {
+      list = null;
+      para.push(line);
+    }
+  }
+  flushPara();
+  return box;
+}
+
+// --- Schreibhilfen für das Textfeld ---
+function wrapSelection(ta, mark) {
+  const { selectionStart: s, selectionEnd: e, value } = ta;
+  const sel = value.slice(s, e) || "Text";
+  ta.value = value.slice(0, s) + mark + sel + mark + value.slice(e);
+  ta.selectionStart = s + mark.length;
+  ta.selectionEnd = s + mark.length + sel.length;
+  ta.focus();
+  ta.dispatchEvent(new Event("input"));
+}
+
+function formatLines(ta, kind) {
+  const spec = {
+    bullet: { re: /^[-*]\s+/, make: () => "- " },
+    number: { re: /^\d+\.\s+/, make: (i) => `${i + 1}. ` },
+    heading: { re: /^#{1,3}\s+/, make: () => "# " },
+  }[kind];
+  const strip = (l) => l.replace(/^([-*]\s+|\d+\.\s+|#{1,3}\s+)/, "");
+  const { selectionStart: s, selectionEnd: e, value } = ta;
+  const from = value.lastIndexOf("\n", s - 1) + 1;
+  let to = value.indexOf("\n", e);
+  if (to === -1) to = value.length;
+  const lines = value.slice(from, to).split("\n");
+  const allHave = lines.every((l) => spec.re.test(l));
+  const out = lines.map((l, i) => (allHave ? strip(l) : spec.make(i) + strip(l))).join("\n");
+  ta.value = value.slice(0, from) + out + value.slice(to);
+  if (s === e) {
+    // Nichts markiert: Cursor ans Ende der Zeile, damit man direkt weiterschreiben kann.
+    ta.selectionStart = ta.selectionEnd = from + out.length;
+  } else {
+    ta.selectionStart = from;
+    ta.selectionEnd = from + out.length;
+  }
+  ta.focus();
+  ta.dispatchEvent(new Event("input"));
+}
+
+// Enter in einer Liste: nächster Punkt; Enter in leerem Punkt beendet die Liste.
+function continueList(e, ta) {
+  if (e.key !== "Enter" || e.isComposing || e.shiftKey || e.metaKey || e.ctrlKey) return;
+  const { selectionStart: s, selectionEnd: en, value } = ta;
+  if (s !== en) return;
+  const lineStart = value.lastIndexOf("\n", s - 1) + 1;
+  const m = value.slice(lineStart, s).match(/^(\s*)([-*]|(\d+)\.)\s+(.*)$/);
+  if (!m) return;
+  e.preventDefault();
+  if (!m[4].trim()) {
+    ta.value = value.slice(0, lineStart) + value.slice(s);
+    ta.selectionStart = ta.selectionEnd = lineStart;
+  } else {
+    const ins = "\n" + m[1] + (m[3] ? `${Number(m[3]) + 1}. ` : `${m[2]} `);
+    ta.value = value.slice(0, s) + ins + value.slice(s);
+    ta.selectionStart = ta.selectionEnd = s + ins.length;
+  }
+  ta.dispatchEvent(new Event("input"));
+}
+
+const autosize = (ta, max = 420) => {
+  ta.style.height = "auto";
+  ta.style.height = Math.min(ta.scrollHeight + 2, max) + "px";
+};
+
+function noteToolbar(ta) {
+  const btn = (label, aria, fn, cls = "") => h("button", {
+    type: "button", class: "btn small tool " + cls, "aria-label": aria, title: aria,
+    onMousedown: (e) => e.preventDefault(), // Auswahl im Textfeld bleibt erhalten
+    onClick: fn,
+  }, label);
+  return h("div", { class: "toolbar", role: "toolbar", "aria-label": "Formatierung" },
+    btn("B", "Fett", () => wrapSelection(ta, "**"), "bold"),
+    btn("I", "Kursiv", () => wrapSelection(ta, "*"), "italic"),
+    btn("H", "Überschrift", () => formatLines(ta, "heading")),
+    btn("• Liste", "Aufzählung", () => formatLines(ta, "bullet")),
+    btn("1. Liste", "Nummerierte Liste", () => formatLines(ta, "number")));
+}
+
+// Eingabefelder für eine Notiz: Werkzeugleiste, Textfeld, Area (Pflicht)
+function noteFields(init, { onChange, onSubmit, rows = 4 }) {
+  const s = { areaId: init.area_id ?? null };
+  const ta = h("textarea", {
+    class: "text-input note-input", rows, placeholder: "Notiz …", maxlength: 20000, "aria-label": "Notiztext",
+    onInput: () => { autosize(ta); onChange?.(); },
+    onKeydown: (e) => {
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); onSubmit?.(); return; }
+      continueList(e, ta);
+    },
+  });
+  ta.value = init.body ?? "";
+  const toolbar = noteToolbar(ta);
+  const areaBox = h("div", { class: "chips", role: "group", "aria-label": "Area" });
+
+  function paint() {
+    if (s.areaId && !areas.some((a) => a.id === s.areaId)) s.areaId = null;
+    areaBox.replaceChildren(...areas.map((a, i) => h("button", {
+      type: "button", class: "chip", "aria-pressed": String(s.areaId === a.id),
+      onClick: (e) => {
+        s.areaId = a.id;
+        paint();
+        onChange?.();
+        if (e.detail === 0) areaBox.children[i]?.focus();
+        else if (window.matchMedia("(pointer: fine)").matches) ta.focus();
+      },
+    }, a.name)));
+  }
+  paint();
+  requestAnimationFrame(() => autosize(ta));
+
+  return {
+    el: h("div", {}, toolbar, ta, h("span", { class: "label" }, "Area (Pflicht)"), areaBox),
+    toolbar, textarea: ta, repaint: paint,
+    isValid: () => ta.value.trim() !== "" && !!s.areaId,
+    values: () => ({ body: ta.value.trim(), area_id: s.areaId }),
+  };
+}
+
+function noteRow(note) {
+  const { title, excerpt } = noteTexts(note.body);
+  return h("li", { class: "note" },
+    h("button", { type: "button", class: "body", onClick: () => openNoteDialog(note) },
+      h("span", { class: "title" }, title || "(leer)"),
+      excerpt ? h("span", { class: "excerpt" }, excerpt) : null,
+      h("span", { class: "meta" },
+        h("span", { class: "badge" }, areaName(note.area_id)),
+        h("span", { class: "badge when" }, shortWhen(note.updated_at)))));
+}
+
+function openNoteDialog(note) {
+  const dlg = h("dialog");
+  const fields = noteFields(note, { onChange: updateSave, onSubmit: save, rows: 10 });
+  const preview = h("div", { class: "card preview", hidden: true });
+  const saveBtn = h("button", { type: "submit", class: "btn primary" }, "Speichern");
+  let mode = "write";
+  const seg = h("div", { class: "seg", role: "tablist" });
+
+  function updateSave() { saveBtn.disabled = !fields.isValid(); }
+  function paintMode() {
+    seg.replaceChildren(...[["write", "Schreiben"], ["preview", "Vorschau"]].map(([key, label]) => h("button", {
+      type: "button", role: "tab", class: "seg-btn", "aria-selected": String(mode === key),
+      onClick: () => {
+        mode = key;
+        if (key === "preview") preview.replaceChildren(renderMarkdown(fields.textarea.value));
+        fields.textarea.hidden = fields.toolbar.hidden = key === "preview";
+        preview.hidden = key !== "preview";
+        paintMode();
+      },
+    }, label)));
+  }
+  async function save() {
+    if (!fields.isValid()) return;
+    saveBtn.disabled = true;
+    try {
+      await updateNote(note.id, fields.values());
+      dlg.close();
+    } catch (e) {
+      toast("Nicht gespeichert: " + e.message, true);
+      updateSave();
+    }
+  }
+  const del = confirmButton("Löschen", "Wirklich löschen?", async () => {
+    try { await deleteNote(note.id); dlg.close(); } catch (e) { toast("Nicht gelöscht: " + e.message, true); }
+  });
+
+  paintMode();
+  // Die Vorschau steht zwischen Werkzeugleiste/Textfeld und den Area-Buttons.
+  fields.el.insertBefore(preview, fields.el.querySelector(".label"));
+  dlg.append(h("form", { class: "sheet", onSubmit: (e) => { e.preventDefault(); save(); } },
+    h("h2", {}, "Notiz"), seg, fields.el,
+    h("div", { class: "row-actions" }, del,
+      h("div", { class: "right" },
+        h("button", { type: "button", class: "btn", onClick: () => dlg.close() }, "Abbrechen"), saveBtn))));
+  showDialog(dlg, { focusDialog: true });
+  updateSave();
+  autosize(fields.textarea);
+}
+
+// Seite "Notizen": Formular, Filter nach Area, Liste
+function buildNotesPage() {
+  const form = h("form", { class: "card add", onSubmit: (e) => { e.preventDefault(); saveNew(); } });
+  const holder = h("div");
+  const saveBtn = h("button", { type: "submit", class: "btn primary" }, "Notiz speichern");
+  let fields = noteFields({}, { onChange: updateSave, onSubmit: saveNew });
+
+  function updateSave() { saveBtn.disabled = !fields.isValid(); }
+  async function saveNew() {
+    if (!fields.isValid()) return;
+    saveBtn.disabled = true;
+    try {
+      await createNote(fields.values());
+      fields = noteFields({}, { onChange: updateSave, onSubmit: saveNew });
+      holder.replaceChildren(fields.el);
+      fields.textarea.focus();
+      toast("Gespeichert");
+    } catch (e) {
+      toast("Nicht gespeichert: " + e.message, true);
+    }
+    updateSave();
+  }
+
+  holder.append(fields.el);
+  form.append(holder, h("div", { class: "actions" }, h("span", { class: "hint" }, "Strg/⌘ + Enter speichert"), saveBtn));
+
+  const filters = h("nav", { class: "filters", "aria-label": "Notizen nach Area" });
+  const list = h("ul", { class: "list" });
+  updateSave();
+  return { el: h("section", {}, form, filters, list), form, filters, list, repaint: () => fields.repaint(), updateSave };
+}
+
+function renderNotes() {
+  const n = ui.notes;
+  if (!n) return;
+  const hasAreas = areas.length > 0;
+  n.form.hidden = !hasAreas || !!notesError;
+  n.repaint();
+  n.updateSave();
+
+  if (notesError) {
+    n.filters.replaceChildren();
+    n.list.replaceChildren(h("li", { class: "empty" }, "Notizen sind noch nicht eingerichtet: " + notesError));
+    return;
+  }
+  if (!hasAreas) {
+    n.filters.replaceChildren();
+    n.list.replaceChildren(h("li", { class: "empty" },
+      h("p", {}, "Lege zuerst deine erste Area an."),
+      h("button", { type: "button", class: "btn primary", onClick: openAreasDialog }, "Areas verwalten")));
+    return;
+  }
+  if (noteView.areaId && !areas.some((a) => a.id === noteView.areaId)) noteView.areaId = null;
+
+  const chips = [
+    { id: null, label: "Alle", count: notes.length },
+    ...areas.map((a) => ({ id: a.id, label: a.name, count: notes.filter((x) => x.area_id === a.id).length })),
+  ];
+  n.filters.replaceChildren(...chips.map((c) => h("button", {
+    type: "button", class: "chip", "aria-pressed": String(noteView.areaId === c.id),
+    onClick: () => { noteView.areaId = c.id; renderNotes(); },
+  }, c.label, c.count ? h("span", { class: "count" }, String(c.count)) : null)));
+
+  const shown = notes.filter((x) => !noteView.areaId || x.area_id === noteView.areaId);
+  n.list.replaceChildren(...(shown.length ? shown.map(noteRow) : [h("li", { class: "empty" }, "Noch keine Notizen.")]));
+}
+
+// ---------- Umschalter Aufgaben / Notizen ----------
+function renderTabs() {
+  if (!ui.tabs) return;
+  ui.tabs.replaceChildren(...[["tasks", "Aufgaben"], ["notes", "Notizen"]].map(([key, label]) => h("button", {
+    type: "button", role: "tab", class: "seg-btn", "aria-selected": String(page === key),
+    onClick: () => setPage(key),
+  }, label)));
+  ui.title.textContent = page === "tasks" ? "Aufgaben" : "Notizen";
+  ui.tasksPage.hidden = page !== "tasks";
+  ui.notesPage.hidden = page !== "notes";
+}
+
+function setPage(p) {
+  page = p;
+  try { localStorage.setItem("page", p); } catch { /* ohne Speicher weiter */ }
+  renderTabs();
+}
+
 // ---------- Hauptansicht ----------
 function showApp() {
   appMounted = true;
@@ -503,15 +893,21 @@ function showApp() {
     list: h("ul", { class: "list" }),
     addCard: form,
     updateSave,
+    title: h("h1", {}, "Aufgaben"),
+    tabs: h("div", { class: "seg", role: "tablist", "aria-label": "Bereich" }),
+    notes: buildNotesPage(),
   };
+  ui.tasksPage = h("section", {}, form, ui.filters, ui.list);
+  ui.notesPage = ui.notes.el;
 
   root.replaceChildren(h("div", { class: "wrap" },
     h("header", { class: "topbar" },
-      h("h1", {}, "Aufgaben"),
+      ui.title,
       h("div", { class: "actions" },
         h("button", { type: "button", class: "btn", onClick: openAreasDialog }, "Areas"),
         h("button", { type: "button", class: "btn", onClick: () => sb.auth.signOut() }, "Abmelden"))),
-    form, ui.filters, ui.list));
+    ui.tabs, ui.tasksPage, ui.notesPage));
+  renderTabs();
 
   updateSave();
   load();
@@ -520,7 +916,7 @@ function showApp() {
 // ---------- Anmeldung ----------
 function showLogin() {
   appMounted = false;
-  areas = []; openTasks = []; doneTasks = [];
+  areas = []; openTasks = []; doneTasks = []; notes = [];
   const err = h("p", { class: "error", role: "alert" });
   const email = h("input", { type: "email", class: "field", required: true, autocomplete: "username", placeholder: "E-Mail", "aria-label": "E-Mail" });
   const pass = h("input", { type: "password", class: "field", required: true, autocomplete: "current-password", placeholder: "Passwort", "aria-label": "Passwort" });

@@ -1,9 +1,10 @@
 # Aufgaben-App
 
-Persönliche Aufgabenliste als Web-App (PWA). Jede Aufgabe gehört zu genau einer Area.
+Persönliche Aufgabenliste und Notizen als Web-App (PWA). Jede Aufgabe und jede Notiz gehört zu genau einer Area.
 
 - `docs/` – die Web-App (reines HTML/CSS/JavaScript, ohne Build). Wird über GitHub Pages ausgeliefert.
-- `supabase/01_schema.sql` – Datenbank-Tabellen und Zugriffsregeln (Supabase / PostgreSQL).
+- `supabase/01_schema.sql` – Datenbank-Tabellen für Areas und Aufgaben samt Zugriffsregeln (Supabase / PostgreSQL).
+- `supabase/02_notes.sql` – Tabelle für Notizen (nach 01 ausführen).
 - `supabase/functions/capture/` – kleine Funktion für die Schnellerfassung (Kurzbefehle).
 
 Die Daten liegen in einer privaten Supabase-Datenbank hinter einer Anmeldung.

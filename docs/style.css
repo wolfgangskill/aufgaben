@@ -123,6 +123,42 @@ button { cursor: pointer; }
 
 .empty { text-align: center; color: var(--muted); padding: 40px 12px; }
 
+/* Umschalter Aufgaben / Notizen und Schreiben / Vorschau */
+.seg { display: flex; gap: 4px; padding: 4px; margin: 0 0 14px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; }
+.seg-btn { flex: 1; min-height: 40px; border: 0; border-radius: 10px; background: transparent; }
+.seg-btn[aria-selected="true"] { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+.seg-btn:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.sheet .seg { margin: 8px 0 12px; }
+
+/* Notizen: Werkzeugleiste, Textfeld, Liste */
+.toolbar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.tool { min-width: 44px; }
+.tool.bold { font-weight: 800; }
+.tool.italic { font-style: italic; }
+.note-input { display: block; padding: 12px 14px; min-height: 96px; line-height: 1.45; resize: vertical; font: inherit; }
+.add .actions { align-items: center; gap: 12px; }
+.add .actions .hint { margin-right: auto; }
+.hint { color: var(--muted); font-size: .8rem; }
+.note { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); }
+.note .body { display: block; width: 100%; padding: 12px 14px; text-align: left; background: none; border: 0; cursor: pointer; }
+.note .title { display: block; font-weight: 600; overflow-wrap: anywhere; }
+.note .excerpt { display: block; margin-top: 2px; color: var(--muted); overflow-wrap: anywhere; }
+.note .meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.badge.when { background: transparent; color: var(--muted); padding-left: 2px; }
+
+/* Formatierte Anzeige (Vorschau) */
+.preview { min-height: 96px; margin-bottom: 4px; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 .8em; overflow-wrap: anywhere; }
+.md h3, .md h4, .md h5 { margin: 1em 0 .4em; line-height: 1.25; }
+.md h3 { font-size: 1.25rem; }
+.md h4 { font-size: 1.1rem; }
+.md h5 { font-size: 1rem; }
+.md ul, .md ol { margin: 0 0 .8em; padding-left: 1.4em; }
+.md li { margin: .15em 0; overflow-wrap: anywhere; }
+.md a { color: var(--accent); }
+
 /* Dialoge */
 dialog {
   width: min(560px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); padding: 0;
