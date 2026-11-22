@@ -146,6 +146,13 @@ button { cursor: pointer; }
 .note .meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .badge.when { background: transparent; color: var(--muted); padding-left: 2px; }
 
+/* Suche */
+.searchbar { margin: 0 0 14px; }
+.searchbar input { background: var(--card); }
+.search-info { margin: 0 0 8px; }
+.badge.kind { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+mark { background: var(--accent-soft); color: inherit; border-radius: 3px; padding: 0 2px; font-weight: 600; }
+
 /* Formatierte Anzeige (Vorschau) */
 .preview { min-height: 96px; margin-bottom: 4px; }
 .md > :first-child { margin-top: 0; }

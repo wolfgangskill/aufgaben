@@ -7,6 +7,10 @@
 
 const sb = window.supabase.createClient(window.APP_CONFIG.url, window.APP_CONFIG.key);
 
+// Nur diese Spalten laden (die Suchspalte "search" wird nicht mit übertragen).
+const TASK_COLS = "id, area_id, title, status, due_date, priority, completed_at, created_at, updated_at";
+const NOTE_COLS = "id, area_id, body, created_at, updated_at";
+
 const PRIORITIES = [
   { value: 0, label: "Normal" },
   { value: 1, label: "Hoch" },
@@ -106,6 +110,14 @@ let notes = [];
 let notesError = null;            // Meldung, falls die Tabelle "notes" nicht erreichbar ist
 let page = "tasks";               // tasks | notes
 let noteView = { areaId: null };  // null = alle Areas
+
+// Suche
+let searchQuery = "";
+let searchResults = [];
+let searchPending = false;
+let searchSeq = 0;
+let searchTimer;
+const isSearching = () => searchQuery.length >= 2;
 try { if (localStorage.getItem("page") === "notes") page = "notes"; } catch { /* ohne Speicher weiter */ }
 
 const areaName = (id) => areas.find((a) => a.id === id)?.name ?? "?";
@@ -147,9 +159,9 @@ function applyTask(row) {
 async function load() {
   const [a, o, d, nt] = await Promise.all([
     sb.from("areas").select("*").order("sort_order").order("name"),
-    sb.from("tasks").select("*").eq("status", "open"),
-    sb.from("tasks").select("*").eq("status", "done").order("completed_at", { ascending: false }).limit(100),
-    sb.from("notes").select("*").order("updated_at", { ascending: false }).limit(500),
+    sb.from("tasks").select(TASK_COLS).eq("status", "open"),
+    sb.from("tasks").select(TASK_COLS).eq("status", "done").order("completed_at", { ascending: false }).limit(100),
+    sb.from("notes").select(NOTE_COLS).order("updated_at", { ascending: false }).limit(500),
   ]);
   const err = a.error || o.error || d.error;
   if (err) {
@@ -167,14 +179,14 @@ async function load() {
 }
 
 async function createTask(values) {
-  const { data, error } = await sb.from("tasks").insert(values).select().single();
+  const { data, error } = await sb.from("tasks").insert(values).select(TASK_COLS).single();
   if (error) throw error;
   applyTask(data);
   render();
 }
 
 async function updateTask(id, patch) {
-  const { data, error } = await sb.from("tasks").update(patch).eq("id", id).select().single();
+  const { data, error } = await sb.from("tasks").update(patch).eq("id", id).select(TASK_COLS).single();
   if (error) throw error;
   applyTask(data);
   render();
@@ -193,7 +205,7 @@ async function toggleDone(task) {
   const before = { ...task };
   applyTask({ ...task, status: next, completed_at: next === "done" ? new Date().toISOString() : null });
   render();
-  const { data, error } = await sb.from("tasks").update({ status: next }).eq("id", task.id).select().single();
+  const { data, error } = await sb.from("tasks").update({ status: next }).eq("id", task.id).select(TASK_COLS).single();
   if (error) {
     applyTask(before);
     render();
@@ -300,6 +312,7 @@ function render() {
   renderTabs();
   renderTasks();
   renderNotes();
+  if (isSearching()) runSearch(); // Trefferliste nach Änderungen auffrischen
 }
 
 function renderTasks() {
@@ -499,14 +512,14 @@ function applyNote(row) {
 }
 
 async function createNote(values) {
-  const { data, error } = await sb.from("notes").insert(values).select().single();
+  const { data, error } = await sb.from("notes").insert(values).select(NOTE_COLS).single();
   if (error) throw error;
   applyNote(data);
   render();
 }
 
 async function updateNote(id, patch) {
-  const { data, error } = await sb.from("notes").update(patch).eq("id", id).select().single();
+  const { data, error } = await sb.from("notes").update(patch).eq("id", id).select(NOTE_COLS).single();
   if (error) throw error;
   applyNote(data);
   render();
@@ -844,6 +857,108 @@ function renderNotes() {
   n.list.replaceChildren(...(shown.length ? shown.map(noteRow) : [h("li", { class: "empty" }, "Noch keine Notizen.")]));
 }
 
+// ---------- Suche (Aufgaben und Notizen, Wortstamm plus Wortteil) ----------
+// Die Datenbank-Funktion search_all liefert Treffer; Fundstellen sind mit «…» markiert.
+function buildSearch() {
+  const input = h("input", {
+    type: "search", class: "text-input", placeholder: "Suchen in Aufgaben und Notizen …",
+    "aria-label": "Suchen", autocomplete: "off", enterkeyhint: "search",
+    onInput: () => { clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 250); },
+    onKeydown: (e) => { if (e.key === "Escape") { input.value = ""; runSearch(); } },
+  });
+  const info = h("p", { class: "hint search-info" });
+  const list = h("ul", { class: "list" });
+  return { input, info, list, page: h("section", { hidden: true }, info, list), bar: h("div", { class: "searchbar" }, input) };
+}
+
+async function runSearch() {
+  const q = ui.search.input.value.trim();
+  searchQuery = q;
+  if (q.length < 2) {
+    searchSeq++;
+    searchResults = [];
+    searchPending = false;
+    renderTabs();
+    return;
+  }
+  const seq = ++searchSeq;
+  searchPending = true;
+  renderTabs();
+  const { data, error } = await sb.rpc("search_all", { q });
+  if (seq !== searchSeq) return; // inzwischen wurde etwas Neues gesucht
+  searchPending = false;
+  if (error) {
+    toast("Suche fehlgeschlagen: " + error.message, true);
+    searchResults = [];
+  } else {
+    searchResults = data;
+  }
+  renderTabs();
+}
+
+function clearSearch() {
+  searchSeq++;
+  searchQuery = "";
+  searchResults = [];
+  searchPending = false;
+  if (ui.search) ui.search.input.value = "";
+}
+
+// Text mit «Markierung» in Elemente umwandeln; ohne Markierung (reine Wortteil-Treffer) wird der Suchbegriff selbst markiert.
+function snippetNodes(raw, q) {
+  const text = raw.replace(/^\s*(#{1,3}|[-*]|\d+\.)\s+/gm, "").replace(/\*\*|\*/g, "").replace(/\s+/g, " ").trim();
+  if (text.includes("«")) {
+    const parts = text.split("«");
+    const out = [parts[0]];
+    for (const p of parts.slice(1)) {
+      const i = p.indexOf("»");
+      if (i < 0) out.push(p);
+      else out.push(h("mark", {}, p.slice(0, i)), p.slice(i + 1));
+    }
+    return out;
+  }
+  const i = text.toLowerCase().indexOf(q.toLowerCase());
+  return i < 0 ? [text] : [text.slice(0, i), h("mark", {}, text.slice(i, i + q.length)), text.slice(i + q.length)];
+}
+
+function resultRow(r) {
+  const isTask = r.kind === "task";
+  const meta = [
+    h("span", { class: "badge kind" }, isTask ? "Aufgabe" : "Notiz"),
+    h("span", { class: "badge" }, areaName(r.area_id)),
+  ];
+  if (isTask && r.status === "done") meta.push(h("span", { class: "badge" }, "Erledigt"));
+  if (isTask && r.status === "open" && r.due_date) meta.push(h("span", { class: "badge" }, dueLabel(r.due_date)));
+  const snippet = snippetNodes(r.snippet, searchQuery);
+  return h("li", { class: "note" },
+    h("button", { type: "button", class: "body", onClick: () => openResult(r) },
+      isTask ? h("span", { class: "title" }, ...snippet) : h("span", { class: "title" }, noteTexts(r.head).title || "(leer)"),
+      isTask ? null : h("span", { class: "excerpt" }, ...snippet),
+      h("span", { class: "meta" }, meta)));
+}
+
+async function openResult(r) {
+  if (r.kind === "task") {
+    let t = [...openTasks, ...doneTasks].find((x) => x.id === r.id);
+    if (!t) ({ data: t } = await sb.from("tasks").select(TASK_COLS).eq("id", r.id).single());
+    if (t) openEditDialog(t);
+  } else {
+    let n = notes.find((x) => x.id === r.id);
+    if (!n) ({ data: n } = await sb.from("notes").select(NOTE_COLS).eq("id", r.id).single());
+    if (n) openNoteDialog(n);
+  }
+}
+
+function renderSearch() {
+  const s = ui.search;
+  if (!s) return;
+  s.page.hidden = !isSearching();
+  if (!isSearching()) return;
+  s.info.textContent = searchPending && !searchResults.length ? "Suche …"
+    : searchResults.length ? `${searchResults.length} Treffer` : "Keine Treffer.";
+  s.list.replaceChildren(...searchResults.map(resultRow));
+}
+
 // ---------- Umschalter Aufgaben / Notizen ----------
 function renderTabs() {
   if (!ui.tabs) return;
@@ -852,12 +967,14 @@ function renderTabs() {
     onClick: () => setPage(key),
   }, label)));
   ui.title.textContent = page === "tasks" ? "Aufgaben" : "Notizen";
-  ui.tasksPage.hidden = page !== "tasks";
-  ui.notesPage.hidden = page !== "notes";
+  ui.tasksPage.hidden = isSearching() || page !== "tasks";
+  ui.notesPage.hidden = isSearching() || page !== "notes";
+  renderSearch();
 }
 
 function setPage(p) {
   page = p;
+  clearSearch();
   try { localStorage.setItem("page", p); } catch { /* ohne Speicher weiter */ }
   renderTabs();
 }
@@ -896,6 +1013,7 @@ function showApp() {
     title: h("h1", {}, "Aufgaben"),
     tabs: h("div", { class: "seg", role: "tablist", "aria-label": "Bereich" }),
     notes: buildNotesPage(),
+    search: buildSearch(),
   };
   ui.tasksPage = h("section", {}, form, ui.filters, ui.list);
   ui.notesPage = ui.notes.el;
@@ -906,7 +1024,7 @@ function showApp() {
       h("div", { class: "actions" },
         h("button", { type: "button", class: "btn", onClick: openAreasDialog }, "Areas"),
         h("button", { type: "button", class: "btn", onClick: () => sb.auth.signOut() }, "Abmelden"))),
-    ui.tabs, ui.tasksPage, ui.notesPage));
+    ui.tabs, ui.search.bar, ui.tasksPage, ui.notesPage, ui.search.page));
   renderTabs();
 
   updateSave();
@@ -917,6 +1035,7 @@ function showApp() {
 function showLogin() {
   appMounted = false;
   areas = []; openTasks = []; doneTasks = []; notes = [];
+  clearSearch();
   const err = h("p", { class: "error", role: "alert" });
   const email = h("input", { type: "email", class: "field", required: true, autocomplete: "username", placeholder: "E-Mail", "aria-label": "E-Mail" });
   const pass = h("input", { type: "password", class: "field", required: true, autocomplete: "current-password", placeholder: "Passwort", "aria-label": "Passwort" });

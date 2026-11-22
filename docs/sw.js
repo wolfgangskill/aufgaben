@@ -1,7 +1,7 @@
 // Service Worker: legt die App-Dateien im Gerät ab, damit die App schnell startet.
 // Daten (Aufgaben) kommen immer frisch von Supabase und werden hier NICHT zwischengespeichert.
 // Nach jeder Änderung an den App-Dateien die Zahl in CACHE erhöhen.
-const CACHE = "aufgaben-v2";
+const CACHE = "aufgaben-v3";
 const SHELL = [
   "./",
   "index.html",
